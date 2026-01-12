@@ -1,0 +1,196 @@
+import cv2
+import mediapipe as mp
+import time
+import numpy as np
+
+class EyeTracker:
+    def __init__(self):
+        # Initialize MediaPipe Face Mesh
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        
+        # Eye landmark indices
+        # Left eye landmarks
+        self.left_eye_indices = [33, 160, 158, 133, 153, 144, 163, 7]
+        # Right eye landmarks
+        self.right_eye_indices = [362, 385, 387, 263, 373, 380, 373, 373]
+        
+        # Blink detection parameters
+        self.EAR_THRESHOLD = 0.21
+        self.BLINK_FRAME_THRESHOLD = 3
+        
+        # State variables
+        self.blink_count = 0
+        self.frame_count = 0
+        self.consecutive_closed_frames = 0
+        self.total_closed_frames = 0
+        self.total_open_frames = 0
+        self.eye_state = 'open'  # 'open' or 'closed'
+        self.start_time = time.time()
+        
+        # Initialize camera
+        self.cap = cv2.VideoCapture(0)
+        
+    def calculate_ear(self, landmarks, eye_indices):
+        """Calculate Eye Aspect Ratio (EAR) for blink detection"""
+        # Get eye landmarks
+        eye_points = []
+        for idx in eye_indices:
+            eye_points.append([
+                landmarks.landmark[idx].x,
+                landmarks.landmark[idx].y
+            ])
+        
+        eye_points = np.array(eye_points, dtype=np.float32)
+        
+        # Calculate vertical distances
+        vertical_dist_1 = np.linalg.norm(eye_points[1] - eye_points[5])
+        vertical_dist_2 = np.linalg.norm(eye_points[2] - eye_points[4])
+        
+        # Calculate horizontal distance
+        horizontal_dist = np.linalg.norm(eye_points[0] - eye_points[3])
+        
+        # Calculate EAR
+        ear = (vertical_dist_1 + vertical_dist_2) / (2.0 * horizontal_dist)
+        
+        return ear
+    
+    def detect_blink(self, left_ear, right_ear):
+        """Detect blink based on Eye Aspect Ratio"""
+        # Average EAR of both eyes
+        avg_ear = (left_ear + right_ear) / 2.0
+        
+        # Check if eyes are closed
+        if avg_ear < self.EAR_THRESHOLD:
+            self.consecutive_closed_frames += 1
+            self.total_closed_frames += 1
+        else:
+            # Check if we had a blink
+            if self.consecutive_closed_frames >= self.BLINK_FRAME_THRESHOLD:
+                self.blink_count += 1
+            
+            self.consecutive_closed_frames = 0
+            self.total_open_frames += 1
+    
+    def calculate_eye_percentages(self):
+        """Calculate percentage of time eyes have been open and closed"""
+        total_frames = self.total_open_frames + self.total_closed_frames
+        
+        if total_frames == 0:
+            return 0.0, 0.0
+        
+        open_percentage = (self.total_open_frames / total_frames) * 100
+        closed_percentage = (self.total_closed_frames / total_frames) * 100
+        
+        return open_percentage, closed_percentage
+    
+    def draw_eye_landmarks(self, frame, landmarks, eye_indices, color):
+        """Draw eye landmarks on frame"""
+        height, width = frame.shape[:2]
+        
+        for idx in eye_indices:
+            x = int(landmarks.landmark[idx].x * width)
+            y = int(landmarks.landmark[idx].y * height)
+            cv2.circle(frame, (x, y), 2, color, -1)
+    
+    def draw_info(self, frame):
+        """Draw tracking information on frame"""
+        height, width = frame.shape[:2]
+        
+        # Calculate percentages
+        open_pct, closed_pct = self.calculate_eye_percentages()
+        
+        # Calculate elapsed time
+        elapsed_time = time.time() - self.start_time
+        
+        # Prepare text
+        info_lines = [
+            f"Blinks: {self.blink_count}",
+            f"Open: {open_pct:.1f}%",
+            f"Closed: {closed_pct:.1f}%",
+            f"Time: {elapsed_time:.1f}s",
+            f"Press 'S' to stop"
+        ]
+        
+        # Draw text
+        y_offset = 30
+        for line in info_lines:
+            cv2.putText(frame, line, (10, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            y_offset += 30
+        
+        # Draw eye state indicator
+        if self.consecutive_closed_frames >= self.BLINK_FRAME_THRESHOLD:
+            state_text = "EYES CLOSED"
+            state_color = (0, 0, 255)  # Red
+        else:
+            state_text = "EYES OPEN"
+            state_color = (0, 255, 0)  # Green
+        
+        cv2.putText(frame, state_text, (width - 200, 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, state_color, 2)
+    
+    def run(self):
+        """Main tracking loop"""
+        print("Eye Tracker Starting...")
+        print("Press 'S' to stop tracking")
+        
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                print("Failed to capture frame")
+                break
+            
+            # Convert BGR to RGB
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Process frame with MediaPipe
+            results = self.face_mesh.process(rgb_frame)
+            
+            if results.multi_face_landmarks:
+                for face_landmarks in results.multi_face_landmarks:
+                    # Calculate EAR for both eyes
+                    left_ear = self.calculate_ear(face_landmarks, self.left_eye_indices)
+                    right_ear = self.calculate_ear(face_landmarks, self.right_eye_indices)
+                    
+                    # Detect blinks
+                    self.detect_blink(left_ear, right_ear)
+                    
+                    # Draw eye landmarks
+                    self.draw_eye_landmarks(frame, face_landmarks, self.left_eye_indices, (255, 0, 0))
+                    self.draw_eye_landmarks(frame, face_landmarks, self.right_eye_indices, (255, 0, 0))
+            
+            # Draw information on frame
+            self.draw_info(frame)
+            
+            # Display frame
+            cv2.imshow('Eye Tracker', frame)
+            
+            # Check for 'S' key to stop
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('s') or key == ord('S'):
+                print("\nStopping eye tracker...")
+                break
+            
+            self.frame_count += 1
+        
+        # Cleanup
+        self.cap.release()
+        cv2.destroyAllWindows()
+        
+        # Print final statistics
+        print("\n=== Final Statistics ===")
+        open_pct, closed_pct = self.calculate_eye_percentages()
+        print(f"Total Blinks: {self.blink_count}")
+        print(f"Time Eyes Open: {open_pct:.2f}%")
+        print(f"Time Eyes Closed: {closed_pct:.2f}%")
+        print(f"Total Frames: {self.frame_count}")
+
+if __name__ == "__main__":
+    tracker = EyeTracker()
+    tracker.run()
