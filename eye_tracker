@@ -2,195 +2,380 @@ import cv2
 import mediapipe as mp
 import time
 import numpy as np
+from collections import deque
 
-class EyeTracker:
-    def __init__(self):
-        # Initialize MediaPipe Face Mesh
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
-        
-        # Eye landmark indices
-        # Left eye landmarks
-        self.left_eye_indices = [33, 160, 158, 133, 153, 144, 163, 7]
-        # Right eye landmarks
-        self.right_eye_indices = [362, 385, 387, 263, 373, 380, 373, 373]
-        
-        # Blink detection parameters
-        self.EAR_THRESHOLD = 0.21
-        self.BLINK_FRAME_THRESHOLD = 3
-        
-        # State variables
-        self.blink_count = 0
-        self.frame_count = 0
-        self.consecutive_closed_frames = 0
-        self.total_closed_frames = 0
-        self.total_open_frames = 0
-        self.eye_state = 'open'  # 'open' or 'closed'
-        self.start_time = time.time()
-        
-        # Initialize camera
-        self.cap = cv2.VideoCapture(0)
-        
-    def calculate_ear(self, landmarks, eye_indices):
-        """Calculate Eye Aspect Ratio (EAR) for blink detection"""
-        # Get eye landmarks
-        eye_points = []
-        for idx in eye_indices:
-            eye_points.append([
-                landmarks.landmark[idx].x,
-                landmarks.landmark[idx].y
-            ])
-        
-        eye_points = np.array(eye_points, dtype=np.float32)
-        
-        # Calculate vertical distances
-        vertical_dist_1 = np.linalg.norm(eye_points[1] - eye_points[5])
-        vertical_dist_2 = np.linalg.norm(eye_points[2] - eye_points[4])
-        
-        # Calculate horizontal distance
-        horizontal_dist = np.linalg.norm(eye_points[0] - eye_points[3])
-        
-        # Calculate EAR
-        ear = (vertical_dist_1 + vertical_dist_2) / (2.0 * horizontal_dist)
-        
-        return ear
+# =============================
+# Configuration
+# =============================
+# Blink detection parameters
+EAR_THRESHOLD = 0.25  #Eye Aspect Ratio
+BLINK_FRAME_THRESHOLD = 2
+
+# Yawn detection parameters
+YAWN_THRESHOLD = 0.2
+YAWN_FRAME_THRESHOLD = 15
+
+LOGO_PATH = "logo.png"        # path to your logo PNG
+LOGO_HEIGHT = 50             # height to resize logo to (pixels)
+
+# =============================
+# MediaPipe setup
+# =============================
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(
+    max_num_faces=1,
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+
+mp_drawing = mp.solutions.drawing_utils
+mp_drawing_styles = mp.solutions.drawing_styles
+
+# =============================
+# Landmark indices
+# =============================
+# Extended eye landmark indices for better EAR calculation
+left_eye_indices = [33, 160, 158, 133, 153, 144, 163, 7, 
+                    246, 161, 160, 159, 158, 157, 173, 133, 
+                    155, 154, 153, 145, 144, 163, 7]
+#[33, 160, 158, 133, 153, 144]
+right_eye_indices = [362, 385, 387, 263, 373, 380, 373, 373,
+                    466, 388, 387, 386, 385, 384, 398, 263,
+                    249, 390, 373, 374, 380, 381, 382]
+#[362, 385, 387, 263, 373, 380]
+
+# Pupil landmark indices (iris landmarks)
+left_pupil_indices = [468, 469, 470, 471, 472]
+right_pupil_indices = [473, 474, 475, 476, 477]
+
+# Mouth landmark indices for yawn detection
+mouth_indices = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 
+                 291, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95]
+
+# Eye contours (for drawing)
+LEFT_EYE_CONTOUR = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE_CONTOUR = [362, 385, 387, 263, 373, 380]
+
+# Mouth
+UPPER_LIP = 13
+LOWER_LIP = 14
+LEFT_MOUTH_CORNER = 61
+RIGHT_MOUTH_CORNER = 291
+
+# =============================
+# Helper functions
+# =============================
+
+#
+def draw_points(frame, landmarks, indices, w, h, color, radius=2):
+    for i in indices:
+        x = int(landmarks[i].x * w)
+        y = int(landmarks[i].y * h)
+        cv2.circle(frame, (x, y), radius, color, -1)
+
+def overlay_logo(frame, logo):
+    h, w = frame.shape[:2]
+    lh, lw = logo.shape[:2]
+    x_offset = w - lw - 10
+    y_offset = h - lh - 10
+
+    if logo.shape[2] == 4:  # RGBA logo
+        alpha = logo[:, :, 3] / 255.0
+        for c in range(3):
+            frame[y_offset:y_offset+lh, x_offset:x_offset+lw, c] = (
+                alpha * logo[:, :, c] +
+                (1 - alpha) * frame[y_offset:y_offset+lh, x_offset:x_offset+lw, c]
+            )
+    else:
+        frame[y_offset:y_offset+lh, x_offset:x_offset+lw] = logo
+
+# =============================
+# Load & resize logo
+# =============================
+logo = cv2.imread(LOGO_PATH, cv2.IMREAD_UNCHANGED)  # RGBA
+if logo is None:
+    print("Warning: Logo not found. Continuing without logo.")
+else:
+    scale = LOGO_HEIGHT / logo.shape[0]
+    logo = cv2.resize(
+        logo,
+        (int(logo.shape[1] * scale), LOGO_HEIGHT)
+    )
+
+#
+
+
+
+def draw_points(frame, landmarks, indices, w, h, color, radius=2):
+    for i in indices:
+        x = int(landmarks[i].x * w)
+        y = int(landmarks[i].y * h)
+        cv2.circle(frame, (x, y), radius, color, -1)
+
+def calculate_ear(landmarks, eye_indices):
+    """Calculate Eye Aspect Ratio (EAR) for blink detection"""
+    eye_points = []
+    for idx in eye_indices:
+        eye_points.append([
+            landmarks[idx].x,
+            landmarks[idx].y
+        ])
     
-    def detect_blink(self, left_ear, right_ear):
-        """Detect blink based on Eye Aspect Ratio"""
-        # Average EAR of both eyes
+    eye_points = np.array(eye_points, dtype=np.float32)
+    
+    # Calculate vertical distances
+    vertical_dist_1 = np.linalg.norm(eye_points[1] - eye_points[5])
+    vertical_dist_2 = np.linalg.norm(eye_points[2] - eye_points[4])
+    
+    # Calculate horizontal distance
+    horizontal_dist = np.linalg.norm(eye_points[0] - eye_points[3])
+    
+    if horizontal_dist == 0:
+        return 0
+    
+    ear = (vertical_dist_1 + vertical_dist_2) / (2.0 * horizontal_dist)
+    return ear
+
+def calculate_mar(landmarks):
+    """Calculate Mouth Aspect Ratio (MAR) for yawn detection"""
+    mouth_points = []
+    for idx in mouth_indices:
+        mouth_points.append([
+            landmarks[idx].x,
+            landmarks[idx].y
+        ])
+    
+    mouth_points = np.array(mouth_points, dtype=np.float32)
+    
+    # Calculate vertical distance
+    upper_lip = np.mean(mouth_points[0:10], axis=0)
+    lower_lip = np.mean(mouth_points[10:20], axis=0)
+    vertical_dist = np.linalg.norm(upper_lip - lower_lip)
+    
+    # Calculate horizontal distance
+    left_corner = mouth_points[0]
+    right_corner = mouth_points[6]
+    horizontal_dist = np.linalg.norm(left_corner - right_corner)
+    
+    if horizontal_dist == 0:
+        return 0
+    
+    mar = vertical_dist / horizontal_dist
+    return mar
+
+# =============================
+# State variables
+# =============================
+blink_count = 0
+yawn_count = 0
+frame_count = 0
+consecutive_closed_frames = 0
+consecutive_yawn_frames = 0
+total_closed_frames = 0
+total_open_frames = 0
+eye_state = "OPEN"
+
+# Blink per minute tracking
+blink_history = deque(maxlen=60)
+minute_blink_counts = deque(maxlen=10)
+last_minute_blink_count = 0
+minute_start_time = time.time()
+
+last_frame_time = time.time()
+show_mesh = True
+
+# =============================
+# Camera
+# =============================
+cap = cv2.VideoCapture(0)
+print("MORPHEUS: Eye & Mouth Fatigue Tracker")
+print("ESC = exit | M = toggle face mesh | S = stop and show stats")
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    h, w = frame.shape[:2]
+
+    now = time.time()
+    dt = now - last_frame_time
+    last_frame_time = now
+
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(rgb)
+
+    if results.multi_face_landmarks:
+        face = results.multi_face_landmarks[0].landmark
+
+        # =============================
+        # Eye Aspect Ratio (EAR) calculation
+        # =============================
+        left_ear = calculate_ear(face, left_eye_indices)
+        right_ear = calculate_ear(face, right_eye_indices)
         avg_ear = (left_ear + right_ear) / 2.0
-        
-        # Check if eyes are closed
-        if avg_ear < self.EAR_THRESHOLD:
-            self.consecutive_closed_frames += 1
-            self.total_closed_frames += 1
+
+        # =============================
+        # Blink detection using EAR
+        # =============================
+        if avg_ear < EAR_THRESHOLD:
+            consecutive_closed_frames += 1
+            total_closed_frames += 1
+            eye_state = "CLOSED"
         else:
-            # Check if we had a blink
-            if self.consecutive_closed_frames >= self.BLINK_FRAME_THRESHOLD:
-                self.blink_count += 1
+            if consecutive_closed_frames >= BLINK_FRAME_THRESHOLD:
+                blink_count += 1
+                # Add blink to history with timestamp
+                current_time = time.time()
+                blink_history.append(current_time)
             
-            self.consecutive_closed_frames = 0
-            self.total_open_frames += 1
-    
-    def calculate_eye_percentages(self):
-        """Calculate percentage of time eyes have been open and closed"""
-        total_frames = self.total_open_frames + self.total_closed_frames
-        
-        if total_frames == 0:
-            return 0.0, 0.0
-        
-        open_percentage = (self.total_open_frames / total_frames) * 100
-        closed_percentage = (self.total_closed_frames / total_frames) * 100
-        
-        return open_percentage, closed_percentage
-    
-    def draw_eye_landmarks(self, frame, landmarks, eye_indices, color):
-        """Draw eye landmarks on frame"""
-        height, width = frame.shape[:2]
-        
-        for idx in eye_indices:
-            x = int(landmarks.landmark[idx].x * width)
-            y = int(landmarks.landmark[idx].y * height)
-            cv2.circle(frame, (x, y), 2, color, -1)
-    
-    def draw_info(self, frame):
-        """Draw tracking information on frame"""
-        height, width = frame.shape[:2]
-        
+            consecutive_closed_frames = 0
+            total_open_frames += 1
+            eye_state = "OPEN"
+
+        # =============================
+        # Mouth Aspect Ratio (MAR) calculation
+        # =============================
+        mar = calculate_mar(face)
+
+        # =============================
+        # Yawn detection using MAR
+        # =============================
+        if mar > YAWN_THRESHOLD:
+            consecutive_yawn_frames += 1
+        else:
+            if consecutive_yawn_frames >= YAWN_FRAME_THRESHOLD:
+                yawn_count += 1
+            
+            consecutive_yawn_frames = 0
+
+        # =============================
+        # Update blink per minute statistics
+        # =============================
+        if now - minute_start_time >= 60:
+            # Remove blinks older than 60 seconds
+            while blink_history and now - blink_history[0] > 60:
+                blink_history.popleft()
+            
+            minute_blinks = len(blink_history)
+            minute_blink_counts.append(minute_blinks)
+            minute_start_time = now
+            
+            print(f"\n{'='*60}")
+            print(f"Minute {len(minute_blink_counts)}: {minute_blinks} blinks")
+            print(f"{'='*60}\n")
+
+        # =============================
+        # Draw face mesh
+        # =============================
+        if show_mesh:
+            mp_drawing.draw_landmarks(
+                frame,
+                results.multi_face_landmarks[0],
+                mp_face_mesh.FACEMESH_TESSELATION,
+                landmark_drawing_spec=None,
+                connection_drawing_spec=
+                mp_drawing_styles.get_default_face_mesh_tesselation_style()
+            )
+
+        # =============================
+        # Draw eyes, irises, mouth
+        # =============================
+        draw_points(frame, face, LEFT_EYE_CONTOUR, w, h, (0, 255, 0))
+        draw_points(frame, face, RIGHT_EYE_CONTOUR, w, h, (0, 255, 0))
+        draw_points(frame, face, left_pupil_indices, w, h, (0, 0, 255), 2)
+        draw_points(frame, face, right_pupil_indices, w, h, (0, 0, 255), 2)
+        draw_points(frame, face,
+                    [UPPER_LIP, LOWER_LIP, LEFT_MOUTH_CORNER, RIGHT_MOUTH_CORNER],
+                    w, h, (255, 0, 0), 3)
+
+        # =============================
         # Calculate percentages
-        open_pct, closed_pct = self.calculate_eye_percentages()
-        
-        # Calculate elapsed time
-        elapsed_time = time.time() - self.start_time
-        
-        # Prepare text
-        info_lines = [
-            f"Blinks: {self.blink_count}",
-            f"Open: {open_pct:.1f}%",
-            f"Closed: {closed_pct:.1f}%",
-            f"Time: {elapsed_time:.1f}s",
-            f"Press 'S' to stop"
-        ]
-        
-        # Draw text
-        y_offset = 30
-        for line in info_lines:
-            cv2.putText(frame, line, (10, y_offset), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            y_offset += 30
-        
+        # =============================
+        total_frames = total_open_frames + total_closed_frames
+        open_pct = (total_open_frames / total_frames * 100) if total_frames > 0 else 0
+        closed_pct = (total_closed_frames / total_frames * 100) if total_frames > 0 else 0
+
+        # =============================
+        # Display
+        # =============================
+         # -----------------------------
+        # Overlay logo (bottom-right)
+        # -----------------------------
+        if logo is not None:
+            overlay_logo(frame, logo)
+    
+        cv2.putText(frame, f"Blinks: {blink_count}", (30, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        cv2.putText(frame, f"Eyes Open: {open_pct:.1f}%", (30, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        cv2.putText(frame, f"Eyes Closed: {closed_pct:.1f}%", (30, 100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        cv2.putText(frame, f"Yawns: {yawn_count}", (30, 130),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+        #cv2.putText(frame, f"Eye State: {eye_state}", (30, 160),
+                    #cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    #(0, 255, 0) if eye_state == "OPEN" else (0, 0, 255), 2)
+
+        cv2.putText(frame, f"EAR: {avg_ear:.3f}", (30, 190),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
         # Draw eye state indicator
-        if self.consecutive_closed_frames >= self.BLINK_FRAME_THRESHOLD:
+        if eye_state == "CLOSED":
             state_text = "EYES CLOSED"
-            state_color = (0, 0, 255)  # Red
+            state_color = (0, 0, 255)
         else:
             state_text = "EYES OPEN"
-            state_color = (0, 255, 0)  # Green
+            state_color = (0, 255, 0)
         
-        cv2.putText(frame, state_text, (width - 200, 50), 
+        cv2.putText(frame, state_text, (w - 200, 50), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, state_color, 2)
-    
-    def run(self):
-        """Main tracking loop"""
-        print("Eye Tracker Starting...")
-        print("Press 'S' to stop tracking")
-        
-        while True:
-            ret, frame = self.cap.read()
-            if not ret:
-                print("Failed to capture frame")
-                break
-            
-            # Convert BGR to RGB
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            # Process frame with MediaPipe
-            results = self.face_mesh.process(rgb_frame)
-            
-            if results.multi_face_landmarks:
-                for face_landmarks in results.multi_face_landmarks:
-                    # Calculate EAR for both eyes
-                    left_ear = self.calculate_ear(face_landmarks, self.left_eye_indices)
-                    right_ear = self.calculate_ear(face_landmarks, self.right_eye_indices)
-                    
-                    # Detect blinks
-                    self.detect_blink(left_ear, right_ear)
-                    
-                    # Draw eye landmarks
-                    self.draw_eye_landmarks(frame, face_landmarks, self.left_eye_indices, (255, 0, 0))
-                    self.draw_eye_landmarks(frame, face_landmarks, self.right_eye_indices, (255, 0, 0))
-            
-            # Draw information on frame
-            self.draw_info(frame)
-            
-            # Display frame
-            cv2.imshow('Eye Tracker', frame)
-            
-            # Check for 'S' key to stop
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('s') or key == ord('S'):
-                print("\nStopping eye tracker...")
-                break
-            
-            self.frame_count += 1
-        
-        # Cleanup
-        self.cap.release()
-        cv2.destroyAllWindows()
-        
-        # Print final statistics
-        print("\n=== Final Statistics ===")
-        open_pct, closed_pct = self.calculate_eye_percentages()
-        print(f"Total Blinks: {self.blink_count}")
+
+    cv2.imshow("MORPHEUS: Eye & Mouth Fatigue Tracker", frame)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == 27:
+        break
+    elif key == ord('m'):
+        show_mesh = not show_mesh
+    elif key == ord('s') or key == ord('S'):
+        print("\n" + "="*60)
+        print("FINAL STATISTICS")
+        print("="*60)
+        print(f"Total Blinks: {blink_count}")
+        print(f"Total Yawns: {yawn_count}")
         print(f"Time Eyes Open: {open_pct:.2f}%")
         print(f"Time Eyes Closed: {closed_pct:.2f}%")
-        print(f"Total Frames: {self.frame_count}")
+        print(f"Total Frames: {frame_count}")
+        
+        print("\n" + "="*60)
+        print("BLINKS PER MINUTE TABLE")
+        print("="*60)
+        print(f"{'Minute':<10} {'Blinks':<15}")
+        print("-"*60)
+        
+        for i, count in enumerate(minute_blink_counts):
+            print(f"{i + 1:<10} {count:<15}")
+        
+        # Current minute (in progress)
+        current_blinks = len(blink_history)
+        elapsed = now - (minute_start_time - 60 * len(minute_blink_counts))
+        print(f"{len(minute_blink_counts) + 1:<10} {current_blinks:<15} (current)")
+        print("="*60)
+        
+        if len(minute_blink_counts) > 0:
+            print(f"Average blinks/minute: {np.mean(list(minute_blink_counts)):.1f}")
+        print("="*60 + "\n")
+        break
 
-if __name__ == "__main__":
-    tracker = EyeTracker()
-    tracker.run()
+   
+    frame_count += 1
+
+cap.release()
+cv2.destroyAllWindows()
